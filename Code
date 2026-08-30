@@ -1,0 +1,134 @@
+// --- Pins ---
+const int ENCODER_CLK = 4;
+const int ENCODER_DT = 3;
+const int HALL_PIN = 2; 
+const int RPWM = 5; 
+const int LPWM = 6;
+const int R_EN = 7;
+const int L_EN = 8;
+
+// --- Encoder & Target Variables ---
+int lastClkState;
+float targetRPM = 0;
+float currentTargetRPM = 0; 
+const int maxRPM = 30000;
+const float smoothingFactor = 0.1; // Increased for slightly faster response
+
+// --- Control Variables ---
+volatile unsigned long pulseTime = 0;
+volatile unsigned long lastPulseTime = 0;
+volatile bool newPulse = false;
+float actualRPM = 0;
+float integral = 0;
+char currentDir = 'S'; 
+
+// --- PI Tuning Parameters ---
+float Kp = 0.18;  
+float Ki = 0.09; 
+int basePWM = 50; // Minimum power to start your specific motor
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Removed the High-Frequency PWM line to restore system stability
+  
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  lastClkState = digitalRead(ENCODER_CLK);
+
+  pinMode(HALL_PIN, INPUT_PULLUP);
+  pinMode(RPWM, OUTPUT);
+  pinMode(LPWM, OUTPUT);
+  pinMode(R_EN, OUTPUT);
+  pinMode(L_EN, OUTPUT);
+
+  // Enable the BTS7960
+  digitalWrite(R_EN, HIGH);
+  digitalWrite(L_EN, HIGH);
+
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), countPulse, FALLING);
+  
+  Serial.println("--- Stable Smooth Control Initialized ---");
+}
+
+void loop() {
+  // 1. Read Rotary Encoder
+  int currentClkState = digitalRead(ENCODER_CLK);
+  if (currentClkState != lastClkState && currentClkState == LOW) {
+    if (digitalRead(ENCODER_DT) != currentClkState) {
+      targetRPM += 25; 
+    } else {
+      targetRPM -= 25; 
+    }
+    targetRPM = constrain(targetRPM, 0, maxRPM);
+  }
+  lastClkState = currentClkState;
+
+  // 2. Smooth Transition (The "Ramp")
+  currentTargetRPM += (targetRPM - currentTargetRPM) * smoothingFactor;
+
+  // 3. Serial Input for Direction
+  if (Serial.available() > 0) {
+    char input = toupper(Serial.read());
+    if (input == 'F' || input == 'R' || input == 'S') {
+      currentDir = input;
+      integral = 0; 
+      Serial.print("DIRECTION: "); Serial.println(currentDir);
+    }
+  }
+
+  // 4. RPM Calculation
+  unsigned long now = micros();
+  if (newPulse) {
+    unsigned long duration = pulseTime - lastPulseTime;
+    if (duration > 0) actualRPM = 60000000.0 / duration;
+    newPulse = false; 
+  }
+  if (now - pulseTime > 400000) actualRPM = 0; 
+
+  // 5. PI Controller
+  float error = currentTargetRPM - actualRPM;
+  int pwmOutput = 0;
+
+  if (currentDir != 'S' && targetRPM > 0) {
+    integral += error;
+    integral = constrain(integral, 0, 1000); 
+    
+    float pwmCalc = (Kp * error) + (Ki * integral) + basePWM;
+    pwmOutput = constrain((int)pwmCalc, 0, 255);
+  } else {
+    integral = 0;
+    pwmOutput = 0;
+  }
+
+  // 6. Motor Output Logic
+  if (currentDir == 'F') {         
+    analogWrite(RPWM, pwmOutput);
+    analogWrite(LPWM, 0);
+  } 
+  else if (currentDir == 'R') {    
+    analogWrite(RPWM, 0);
+    analogWrite(LPWM, pwmOutput);
+  } 
+  else {                           
+    // To avoid sudden stop, we let it coast
+    analogWrite(RPWM, 0);
+    analogWrite(LPWM, 0);
+  }
+
+  // 7. Logging
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog > 500) {
+    Serial.print("MODE:"); Serial.print(currentDir);
+    Serial.print(" | SET:"); Serial.print((int)targetRPM);
+    Serial.print(" | ACT:"); Serial.print((int)actualRPM);
+    Serial.print(" | PWM:"); Serial.println(pwmOutput);
+    lastLog = millis();
+  }
+}
+
+void countPulse() {
+  lastPulseTime = pulseTime;
+  pulseTime = micros();
+  newPulse = true;
+}
